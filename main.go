@@ -87,26 +87,6 @@ func main() {
 		log.Printf("Using alternative index location: %s", indexDir)
 	}
 	log.Printf("Index directory: %s", indexDir)
-}
-
-// tryCreateAndWrite пытается создать директорию и проверить права на запись
-func tryCreateAndWrite(dir string) bool {
-	// Создаем директорию если её нет
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return false
-		}
-		log.Printf("Created directory: %s", dir)
-	}
-	
-	// Проверяем права на запись (пробуем создать тестовый файл)
-	testFile := filepath.Join(dir, ".write_test")
-	if err := os.WriteFile(testFile, []byte("test"), 0644); err != nil {
-		return false
-	}
-	os.Remove(testFile) // Удаляем тестовый файл
-	log.Printf("Write permission verified for: %s", dir)
-	return true
 
 	// Получаем локальный IP адрес
 	localIP, err := getLocalIP()
