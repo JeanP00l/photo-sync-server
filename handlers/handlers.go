@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -11,7 +14,7 @@ import (
 	"photo-sync-server/storage"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
+	"github.com/rwcarlsen/goexif/exif"
 )
 
 // Handlers содержит все обработчики HTTP запросов
@@ -36,9 +39,19 @@ func NewHandlers(sessionStore *storage.SessionStore, fileManager *storage.FileMa
 	}
 }
 
+// generateShortToken генерирует короткий hex токен (12 символов, 6 байт)
+func generateShortToken() string {
+	bytes := make([]byte, 6)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback к текущему времени в случае ошибки
+		binary.BigEndian.PutUint64(bytes, uint64(time.Now().UnixNano()))
+	}
+	return hex.EncodeToString(bytes)
+}
+
 // StartHandler обрабатывает запрос на создание сессии
 func (h *Handlers) StartHandler(c *gin.Context) {
-	token := uuid.New().String()
+	token := generateShortToken()
 	_ = h.sessionStore.Create(token) // Создаем сессию
 
 	url := fmt.Sprintf("http://%s:%d/sync?token=%s", h.localIP, h.port, token)
@@ -280,13 +293,56 @@ func (h *Handlers) DeleteSessionHandler(c *gin.Context) {
 
 // extractUserCommentFromEXIF извлекает полный USER_COMMENT из EXIF метаданных
 func extractUserCommentFromEXIF(data []byte) string {
+	// Используем библиотеку goexif для правильного парсинга EXIF
+	reader := bytes.NewReader(data)
+	x, err := exif.Decode(reader)
+	if err != nil {
+		// Fallback к упрощенному поиску
+		return findUserCommentFallback(data)
+	}
+
+	// Ищем USER_COMMENT тег (0x9286)
+	userCommentTag, err := x.Get(exif.UserComment)
+	if err != nil {
+		// Fallback к упрощенному поиску
+		return findUserCommentFallback(data)
+	}
+
+	// Получаем значение тега
+	userComment, err := userCommentTag.StringVal()
+	if err != nil {
+		// Fallback к упрощенному поиску
+		return findUserCommentFallback(data)
+	}
+
+	// Удаляем префикс кодировки, если он есть (ASCII\0\0\0 или UNICODE\0\0\0)
+	// Согласно стандарту EXIF, UserComment может иметь префикс кодировки
+	userComment = cleanUserComment(userComment)
+
+	return userComment
+}
+
+// extractCounterNumberFromEXIF извлекает номер счетчика из EXIF метаданных USER_COMMENT
+func extractCounterNumberFromEXIF(data []byte) string {
+	// Используем extractUserCommentFromEXIF для получения полного комментария
+	userComment := extractUserCommentFromEXIF(data)
+	if userComment != "" {
+		return userComment
+	}
+	// Если не нашли через goexif, пробуем fallback метод
+	return findUserCommentFallback(data)
+}
+
+// findUserCommentFallback ищет USER_COMMENT в EXIF данных (fallback реализация)
+// Используется, если goexif не смог распарсить EXIF
+func findUserCommentFallback(data []byte) string {
+
 	// Проверяем JPEG маркер
 	if len(data) < 2 || data[0] != 0xFF || data[1] != 0xD8 {
 		return ""
 	}
 
 	offset := 2
-	exifSegmentsFound := 0
 	for offset < len(data)-1 {
 		// Ищем маркер сегмента
 		if data[offset] != 0xFF {
@@ -303,7 +359,6 @@ func extractUserCommentFromEXIF(data []byte) string {
 
 		// APP1 сегмент содержит EXIF данные
 		if marker == 0xE1 {
-			exifSegmentsFound++
 			if offset+2 > len(data) {
 				break
 			}
@@ -315,7 +370,7 @@ func extractUserCommentFromEXIF(data []byte) string {
 			// Проверяем "Exif\0\0" заголовок
 			if offset+6 <= len(data) && string(data[offset+2:offset+8]) == "Exif\x00\x00" {
 				// Ищем USER_COMMENT в EXIF данных
-				comment := findUserComment(data[offset+2 : offset+length])
+				comment := findUserCommentInRawData(data[offset+2 : offset+length])
 				if comment != "" {
 					return comment
 				}
@@ -339,25 +394,14 @@ func extractUserCommentFromEXIF(data []byte) string {
 	return ""
 }
 
-// extractCounterNumberFromEXIF извлекает номер счетчика из EXIF метаданных USER_COMMENT
-func extractCounterNumberFromEXIF(data []byte) string {
-	// Используем extractUserCommentFromEXIF для получения полного комментария
-	// Функция findUserComment уже извлекает номер счетчика из комментария
-	return extractUserCommentFromEXIF(data)
-}
-
-// findUserComment ищет USER_COMMENT в EXIF данных (упрощенная реализация)
-func findUserComment(exifData []byte) string {
-	// USER_COMMENT имеет тег 0x9286 в IFD0 или IFD1
-	// Это упрощенная реализация, которая ищет строку в EXIF данных
-	// Для полной реализации нужен полный парсер EXIF структуры
-
-	// Ищем паттерн, который может быть номером счетчика (цифры и буквы, минимум 10 символов)
+// findUserCommentInRawData ищет номер счетчика в сырых EXIF данных
+// Ищет номера длиной от 3 символов (вместо 8-10)
+func findUserCommentInRawData(exifData []byte) string {
 	// Ищем в виде строки в EXIF данных
 	dataStr := string(exifData)
 
-	// Ищем последовательности букв и цифр длиной >= 10 символов
-	// Это может быть номер счетчика
+	// Ищем последовательности букв и цифр длиной от 3 символов
+	// Сначала ищем более длинные последовательности (от 10 символов)
 	for i := 0; i < len(dataStr)-10; i++ {
 		if isAlphanumeric(dataStr[i]) {
 			j := i
@@ -375,14 +419,32 @@ func findUserComment(exifData []byte) string {
 		}
 	}
 
-	// Также ищем более короткие последовательности (от 8 символов) для номеров счетчиков
-	for i := 0; i < len(dataStr)-8; i++ {
+	// Ищем средние последовательности (от 5 до 9 символов)
+	for i := 0; i < len(dataStr)-5; i++ {
 		if isAlphanumeric(dataStr[i]) {
 			j := i
 			for j < len(dataStr) && (isAlphanumeric(dataStr[j]) || isCyrillic(dataStr[j])) {
 				j++
 			}
-			if j-i >= 8 && j-i < 10 {
+			if j-i >= 5 && j-i < 10 {
+				candidate := dataStr[i:j]
+				// Проверяем, что это похоже на номер счетчика (содержит цифры и только буквы/цифры)
+				if containsDigit(candidate) && isOnlyAlphanumeric(candidate) {
+					return candidate
+				}
+			}
+			i = j
+		}
+	}
+
+	// Ищем короткие последовательности (от 3 до 4 символов) - для коротких номеров счетчиков
+	for i := 0; i < len(dataStr)-3; i++ {
+		if isAlphanumeric(dataStr[i]) {
+			j := i
+			for j < len(dataStr) && (isAlphanumeric(dataStr[j]) || isCyrillic(dataStr[j])) {
+				j++
+			}
+			if j-i >= 3 && j-i < 5 {
 				candidate := dataStr[i:j]
 				// Проверяем, что это похоже на номер счетчика (содержит цифры и только буквы/цифры)
 				if containsDigit(candidate) && isOnlyAlphanumeric(candidate) {
@@ -421,4 +483,27 @@ func isOnlyAlphanumeric(s string) bool {
 		}
 	}
 	return true
+}
+
+// cleanUserComment удаляет префикс кодировки из UserComment
+// Согласно стандарту EXIF, UserComment может иметь префикс "ASCII\0\0\0" или "UNICODE\0\0\0"
+func cleanUserComment(comment string) string {
+	if len(comment) == 0 {
+		return comment
+	}
+
+	// Проверяем префикс "ASCII\0\0\0" (8 символов)
+	if len(comment) > 8 && comment[:5] == "ASCII" {
+		// Пропускаем "ASCII" и следующие 3 нулевых байта
+		return comment[8:]
+	}
+
+	// Проверяем префикс "UNICODE\0\0\0" (10 символов)
+	if len(comment) > 10 && comment[:7] == "UNICODE" {
+		// Пропускаем "UNICODE" и следующие 3 нулевых байта
+		return comment[10:]
+	}
+
+	// Если префикса нет, возвращаем как есть
+	return comment
 }
